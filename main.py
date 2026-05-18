@@ -3,7 +3,7 @@ import google.generativeai as genai
 import mysql.connector
 from tabulate import tabulate 
 
-API_KEY = "AIzaSyC5fIPtlAMichScM7Vd7lQVnRRL1SF0ZEo"
+API_KEY = os.environ.get("GEMINI_API_KEY")
 DB_CONFIG = {
     "host" : "localhost",
     "user" : "root",
