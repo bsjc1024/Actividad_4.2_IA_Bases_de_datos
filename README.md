@@ -1,6 +1,6 @@
 # Asistente Conversacional de Base de Datos con IA
 
-Proyecto para la **Actividad 4.2: IA y Bases de datos**.
+**Actividad 4.2: IA y Bases de datos**.
 
 Este sistema permite hacer preguntas en español sobre una base de datos de e-commerce. Gemini traduce la pregunta a SQL, el sistema valida que la consulta sea únicamente `SELECT`, ejecuta `EXPLAIN`, corre la consulta en MySQL, muestra los resultados en formato tabular y registra una auditoría mediante un trigger.
 
