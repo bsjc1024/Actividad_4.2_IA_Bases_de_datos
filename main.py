@@ -1,152 +1,122 @@
+"""
+main.py
+
+Asistente conversacional Text-to-SQL para una base de datos de e-commerce.
+"""
+
+from __future__ import annotations
+
+import argparse
 import os
-import google.generativeai as genai
-import mysql.connector
-from tabulate import tabulate 
 
-API_KEY = os.environ.get("GEMINI_API_KEY")
-DB_CONFIG = {
-    "host" : "localhost",
-    "user" : "root",
-    "database" : "ecommerce"
-}
+from dotenv import load_dotenv
+from tabulate import tabulate
 
-SCHEMA_DDL = """
-CREATE TABLE clientes (
-  id_cliente INT PRIMARY KEY AUTO_INCREMENT,
-  nombre VARCHAR(100), email VARCHAR(100),
-  ciudad VARCHAR(100), fecha_registro DATE
-);
-CREATE TABLE productos (
-  id_producto INT PRIMARY KEY AUTO_INCREMENT,
-  nombre VARCHAR(100), categoria VARCHAR(50),
-  precio DECIMAL(10,2), stock INT, stock_minimo INT
-);
-CREATE TABLE pedidos (
-  id_pedido INT PRIMARY KEY AUTO_INCREMENT,
-  id_cliente INT, fecha_pedido DATETIME,
-  estado VARCHAR(30), total DECIMAL(10,2)
-);
-CREATE TABLE detalle_pedido (
-  id_detalle INT PRIMARY KEY AUTO_INCREMENT,
-  id_pedido INT, id_producto INT,
-  cantidad INT, precio_unitario DECIMAL(10,2)
-);
-"""
+from db import audit_log, execute_select, explain_cost, extract_schema_ddl, get_connection
+from llm_client import GeminiSQLClient
+from validator import SQLValidationError, validate_select_only
 
-SYSTEM_PROMPT = f"""
-Eres un experto en SQL para MySQL 8.0. 
-Conviertes preguntas en español a consultas SQL válidas.
+load_dotenv()
 
-REGLAS ESTRICTAS:
-- Responde ÚNICAMENTE con SQL válido, sin markdown, sin explicaciones, sin comillas triples.
-- Solo genera sentencias SELECT.
-- Usa solo las tablas del schema proporcionado.
+SAMPLE_QUESTIONS = [
+    "¿Cuáles son los 5 clientes con mayor gasto total en los últimos 6 meses?",
+    "¿Cuántos productos tienen stock por debajo del mínimo en este momento?",
+    "¿Qué ciudad genera el mayor promedio de gasto por pedido?",
+    "Lista los pedidos del último mes que siguen pendientes, de mayor a menor monto.",
+    "¿Cuál es la hora del día con mayor número de ventas registradas?",
+    "¿Cuáles son los productos más vendidos este mes?",
+    "¿Cuántos clientes se registraron en abril?",
+    "¿Qué pedidos pendientes superan $5,000?",
+]
 
-SCHEMA:
-{SCHEMA_DDL}
 
-EJEMPLOS:
-Pregunta: ¿Cuáles son los 5 productos más vendidos?
-SQL: SELECT p.nombre, SUM(dp.cantidad) AS total_vendido FROM productos p JOIN detalle_pedido dp ON p.id_producto = dp.id_producto GROUP BY p.id_producto, p.nombre ORDER BY total_vendido DESC LIMIT 5;
+def should_continue_after_explain(estimated_rows: int) -> bool:
+    max_rows = int(os.getenv("MAX_EXPLAIN_ROWS", "100000"))
+    if estimated_rows <= max_rows:
+        return True
+    print(f"\nAdvertencia: la consulta podría escanear aproximadamente {estimated_rows:,} filas.")
+    answer = input("¿Deseas continuar? [s/n]: ").strip().lower()
+    return answer in {"s", "si", "sí", "y", "yes"}
 
-Pregunta: ¿Cuántos clientes se registraron en abril de 2024?
-SQL: SELECT COUNT(*) AS clientes_abril FROM clientes WHERE MONTH(fecha_registro) = 4 AND YEAR(fecha_registro) = 2024;
 
-Pregunta: ¿Qué pedidos pendientes superan $5,000?
-SQL: SELECT id_pedido, id_cliente, fecha_pedido, total FROM pedidos WHERE estado = 'pendiente' AND total > 5000 ORDER BY total DESC;
-"""
-
-def get_connection():
-    return mysql.connector.connect(**DB_CONFIG)
-
-def translate(question: str) -> str:
-    genai.configure(api_key=API_KEY)
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    response = model.generate_content(
-        f"{SYSTEM_PROMPT}\n\nPregunta: {question}\nSQL:"
-    )
-    sql = response.text.strip()
-    # Limpiar posibles markdown residuales
-    sql = sql.replace("```sql", "").replace("```", "").strip()
-    return sql
-
-FORBIDDEN = {"DROP","INSERT","UPDATE","DELETE","TRUNCATE","ALTER","CREATE","REPLACE","MERGE"}
-
-def validate_select_only(sql: str) -> str:
-    first_word = sql.strip().split()[0].upper()
-    if first_word != "SELECT":
-        raise ValueError(f"Sentencia no permitida: {first_word}. Solo se permiten SELECT.")
-    for word in FORBIDDEN:
-        if word in sql.upper():
-            raise ValueError(f"Palabra prohibida detectada: {word}")
-    return sql
-
-def explain_cost(sql: str, conn) -> dict:
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute(f"EXPLAIN {sql}")
-    rows = cursor.fetchall()
-    total_rows = sum(r.get("rows", 0) or 0 for r in rows)
-    return {"rows": total_rows, "plan": rows}
-
-def audit_log(pregunta: str, sql: str, num_filas: int, conn):
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO log_trigger (pregunta, sql_generado, filas_devueltas) VALUES (%s, %s, %s)",
-        (pregunta, sql, num_filas)
-    )
-    conn.commit()
-
-def main():
+def run_question(question: str, show_sql: bool = True) -> None:
     conn = get_connection()
-    print("=== Asistente de Base de Datos ===")
-    print("Escribe 'salir' para terminar.\n")
+    try:
+        schema_ddl = extract_schema_ddl(conn)
+        if not schema_ddl:
+            raise RuntimeError("No se pudo extraer el DDL. ¿Ya ejecutaste schema.sql?")
 
+        llm = GeminiSQLClient()
+        generated_sql = llm.translate_to_sql(question, schema_ddl)
+
+        if show_sql:
+            print("\nSQL generado por Gemini:")
+            print(generated_sql)
+
+        safe_sql = validate_select_only(generated_sql)
+        cost = explain_cost(conn, safe_sql)
+        estimated_rows = cost["estimated_rows"]
+        print(f"\nEXPLAIN: filas estimadas = {estimated_rows:,}")
+
+        if not should_continue_after_explain(estimated_rows):
+            print("Consulta cancelada por el usuario.")
+            return
+
+        columns, rows = execute_select(conn, safe_sql)
+        print("\nResultados:")
+        if rows:
+            print(tabulate(rows, headers=columns, tablefmt="fancy_grid"))
+        else:
+            print("(Sin resultados)")
+
+        audit_log(conn=conn, question=question, generated_sql=safe_sql, rows_returned=len(rows))
+        print("\nAuditoría registrada correctamente.")
+
+    except SQLValidationError as exc:
+        print(f"\nConsulta rechazada por seguridad: {exc}")
+    finally:
+        conn.close()
+
+
+def interactive_loop() -> None:
+    print("\nAsistente Text-to-SQL para e-commerce")
+    print("Escribe una pregunta en español o 'salir' para terminar.\n")
+    print("Preguntas de ejemplo:")
+    for index, question in enumerate(SAMPLE_QUESTIONS, start=1):
+        print(f"{index}. {question}")
+    print()
     while True:
-        pregunta = input("¿Qué quieres saber sobre el negocio? ").strip()
-        if pregunta.lower() == "salir":
+        question = input("¿Qué quieres saber sobre el negocio? ").strip()
+        if question.lower() in {"salir", "exit", "quit"}:
+            print("Listo. Sesión terminada.")
             break
-        if not pregunta:
-            continue
+        if question:
+            run_question(question)
 
-        try:
-            # 1. Traducir
-            sql = translate(pregunta)
-            print(f"\nSQL generado:\n{sql}\n")
 
-            # 2. Validar seguridad
-            sql = validate_select_only(sql)
+def print_live_ddl() -> None:
+    conn = get_connection()
+    try:
+        print(extract_schema_ddl(conn))
+    finally:
+        conn.close()
 
-            # 3. EXPLAIN
-            cost = explain_cost(sql, conn)
-            print(f"Filas estimadas a escanear: {cost['rows']:,}")
-            if cost["rows"] > 100_000:
-                respuesta = input("⚠️  Advertencia: consulta costosa. ¿Continuar? [s/n]: ")
-                if respuesta.lower() != "s":
-                    print("Consulta cancelada.\n")
-                    continue
 
-            # 4. Ejecutar
-            cursor = conn.cursor()
-            cursor.execute(sql)
-            results = cursor.fetchall()
-            columns = [desc[0] for desc in cursor.description]
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Asistente conversacional Text-to-SQL con Gemini y MySQL.")
+    parser.add_argument("-q", "--question", type=str, help="Pregunta en español para ejecutar una sola vez.")
+    parser.add_argument("--print-ddl", action="store_true", help="Extrae e imprime el DDL real desde MySQL.")
+    parser.add_argument("--hide-sql", action="store_true", help="No mostrar el SQL generado antes de ejecutar.")
+    args = parser.parse_args()
 
-            # 5. Auditoría
-            audit_log(pregunta, sql, len(results), conn)
+    if args.print_ddl:
+        print_live_ddl()
+        return
+    if args.question:
+        run_question(args.question, show_sql=not args.hide_sql)
+        return
+    interactive_loop()
 
-            # 6. Mostrar resultados
-            if results:
-                print(tabulate(results, headers=columns, tablefmt="rounded_outline"))
-                print(f"\n{len(results)} fila(s) devuelta(s).\n")
-            else:
-                print("Sin resultados.\n")
-
-        except ValueError as e:
-            print(f"{e}\n")
-        except Exception as e:
-            print(f"Error: {e}\n")
-
-    conn.close()
 
 if __name__ == "__main__":
-    main()    
+    main()
