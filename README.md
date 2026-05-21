@@ -196,7 +196,7 @@ python-dotenv>=1.0.1
 tabulate>=0.9.0
 ```
 
-Luego instala:
+Luego se debe de instalar:
 
 ```bash
 pip install -r requirements.txt
